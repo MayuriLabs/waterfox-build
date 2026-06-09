@@ -1,0 +1,222 @@
+name: Build Waterfox (fedora aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        type: string
+        required: true
+        default: 'current'
+      DISPLAY_VERSION:
+        description: 'Display Version (e.g. 6.6.14)'
+        required: false
+        type: string
+        default: '6.6.14'
+  workflow_call:
+    inputs:
+      branch:
+        type: string
+        required: true
+      DISPLAY_VERSION:
+        required: false
+        type: string
+        default: '6.6.14'
+
+jobs:
+  build:
+    name: Build on Ubuntu
+    runs-on: ubuntu-22.04-arm
+    
+    env:
+      WFX_RELEASE: 1
+
+    steps:
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 python3-pip python3-venv python3-setuptools libffi-dev nasm patchelf ruby ruby-dev make gcc g++ zstd libgtk-3-dev libdbus-glib-1-dev libx11-xcb-dev pciutils libpulse-dev libasound2-dev xvfb curl wget tar libx11-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.86.0
+
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Checkout waterfox sources
+        uses: actions/checkout@v6
+        with:
+          repository: 'BrowserWorks/waterfox'
+          ref: ${{ github.event.inputs.branch || inputs.branch || 'current' }}
+          path: 'waterfox'
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup mozconfig
+        run: |
+          echo "Setting up aarch64 mozconfig from workflow repository..."
+          cp .mozconfig-aarch64-pc-linux-gnu waterfox/.mozconfig
+
+          # Tweak .mozconfig to prevent OOM errors on GitHub Actions runners
+          echo "Applying memory-saving tweaks for CI..."
+          sed -i 's/--enable-lto/--enable-lto=cross/g' waterfox/.mozconfig
+          echo 'ac_add_options --disable-debug-symbols' >> waterfox/.mozconfig
+
+      - name: Set Display Version
+        if: ${{ inputs.DISPLAY_VERSION != '' }}
+        run: |
+          echo "Setting display version to ${{ inputs.DISPLAY_VERSION }}"
+          echo "${{ inputs.DISPLAY_VERSION }}" > waterfox/browser/config/version_display.txt
+
+      - name: Install Mozilla Clang 19
+        run: |
+          mkdir -p $HOME/.mozbuild
+          # Download Mozilla Clang
+          curl -L https://firefox-ci-tc.services.mozilla.com/api/index/v1/task/gecko.cache.level-3.toolchains.v3.linux64-aarch64-clang-19.latest/artifacts/public/build/clang.tar.zst -o clang.tar.zst
+          
+          if [ -f clang.tar.zst ]; then
+            tar --zstd -xf clang.tar.zst -C $HOME/.mozbuild
+            rm clang.tar.zst
+          fi
+
+      - name: Bootstrap Build Environment
+        env:
+          PIP_CONSTRAINT: /tmp/constraints.txt
+        run: |
+          echo "maturin==1.8.6" > /tmp/constraints.txt
+          cd waterfox
+          ./mach bootstrap --application-choice=browser --no-system-changes
+
+      - name: Stage 1 - Generate instrumented build
+        run: |
+          cd waterfox
+          export GEN_PGO=1
+          ./mach build -j2
+          ./mach package
+
+      - name: Run profile collection
+        run: |
+          cd waterfox
+          mkdir -p /tmp/roothome
+          export RUSTUP_HOME=$HOME/.rustup
+          export CARGO_HOME=$HOME/.cargo
+          export MOZBUILD_STATE_PATH=$HOME/.mozbuild
+          ORIG_HOME=$HOME
+          export HOME=/tmp/roothome
+          xvfb-run ./mach python build/pgo/profileserver.py --binary ./obj-*/dist/waterfox/waterfox
+          
+          # Merge the generated .profraw files into the final merged.profdata file
+          $ORIG_HOME/.mozbuild/clang/bin/llvm-profdata merge -o merged.profdata *.profraw
+
+      - name: Stage 2 - Build with collected profile data
+        run: |
+          cd waterfox
+          ./mach clobber
+          export USE_PGO=1
+          ./mach build -j2
+          ./mach package
+
+      - name: Prepare build artifact
+        run: |
+          DIST_DIR=$(find waterfox/obj-* -maxdepth 2 -type d -name "waterfox" | head -n 1)
+          if [ -z "$DIST_DIR" ]; then
+            echo "Error: Could not find built waterfox directory"
+            exit 1
+          fi
+          echo "Found build at $DIST_DIR"
+          mkdir -p artifact-staging
+          cp -a "$DIST_DIR/"* artifact-staging/
+          
+          # Save the git SHA
+          cd waterfox
+          git rev-parse --short HEAD > ../artifact-staging/GIT_SHA.txt
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterfox-build-aarch64
+          path: artifact-staging/
+          if-no-files-found: error
+
+  package:
+    name: Package for Fedora
+    needs: build
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      matrix:
+        fedora_version: ['43', '44']
+    
+    container:
+      image: fedora:${{ matrix.fedora_version }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Install Packaging Dependencies
+        run: |
+          dnf update -y
+          dnf install -y ruby ruby-devel rubygems rpm-build findutils
+          gem install fpm
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: waterfox-build-aarch64
+          path: /tmp/waterfox-build
+
+      - name: Create RPM Package
+        run: |
+          # Prepare a staging directory for the RPM
+          mkdir -p /tmp/rpm-build/opt/waterfox
+          cp -a /tmp/waterfox-build/* /tmp/rpm-build/opt/waterfox/
+
+          # Create a basic desktop entry and symlink
+          mkdir -p /tmp/rpm-build/usr/bin
+          ln -s /opt/waterfox/waterfox /tmp/rpm-build/usr/bin/waterfox
+
+          # Install the desktop file
+          mkdir -p /tmp/rpm-build/usr/share/applications
+          cp waterfox.desktop /tmp/rpm-build/usr/share/applications/
+
+          # Install PNG icons into hicolor theme directories
+          for size in 16 22 24 32 48 64 128 256; do
+            mkdir -p "/tmp/rpm-build/usr/share/icons/hicolor/${size}x${size}/apps"
+            if [ -f "icons/default/default${size}.png" ]; then
+              cp "icons/default/default${size}.png" "/tmp/rpm-build/usr/share/icons/hicolor/${size}x${size}/apps/waterfox.png"
+            fi
+          done
+
+          # Determine architecture for RPM naming
+          ARCH=$(uname -m)
+
+          # Read the git SHA
+          if [ -f /tmp/waterfox-build/GIT_SHA.txt ]; then
+            GIT_SHA=$(cat /tmp/waterfox-build/GIT_SHA.txt)
+          else
+            GIT_SHA="unknown"
+          fi
+
+          # Determine version
+          APP_VERSION="${{ inputs.DISPLAY_VERSION }}"
+          if [ -z "$APP_VERSION" ]; then
+            APP_VERSION="1.0.0"
+          fi
+
+          # Generate the RPM using fpm
+          fpm -s dir -t rpm \
+            -n waterfox \
+            -v "$APP_VERSION" \
+            --iteration ${GIT_SHA}.fc${{ matrix.fedora_version }} \
+            -p "waterfox-${APP_VERSION}-${GIT_SHA}.fc${{ matrix.fedora_version }}.${ARCH}.rpm" \
+            --description "Waterfox Web Browser" \
+            -C /tmp/rpm-build \
+            opt usr
+
+      - name: Upload RPM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterfox-fc${{ matrix.fedora_version }}-ubuntu-22.04-arm-rpm
+          path: "*.rpm"
+          if-no-files-found: error
